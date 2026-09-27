@@ -24,7 +24,8 @@
     Live solving view (on by default): every new board is solved in front of
     you, step by step, as it happens: the row or column being read (blue
     outline), the tiles it proves (white flash), tiles tried both ways when no
-    line helps (purple), guesses and dead ends when logic runs out (yellow).
+    line helps (purple outlines), guesses and dead ends when logic runs out
+    (orange outlines). Outlines are never the answer: only solid tiles are.
     It starts as soon as a board spawns; turning it on with F6 solves the
     current board live again. It stays on across rounds and re-runs until F6
     turns it off. The answer and auto fill never wait for it.
@@ -37,9 +38,9 @@
     Colours:  green  = fill this tile (walk over it in fill mode)
               yellow = fill, but only a best guess (clues are hidden or ambiguous)
               red x  = must stay empty (only with crosses on)
-    Live view:    green / red x = proven,  white = proven by this step,
-                  purple = what trying a tile would imply,
-                  yellow = what a guess implies]]
+    Live view:    green = proven fill,  white = proven by this step,
+                  purple outline = what trying a tile would imply,
+                  orange outline = what a search guess implies (not the answer)]]
 
 local CFG = {
 	togglekey = 0x77,   -- F8: overlay
@@ -76,6 +77,7 @@ local COL = {
 	flash = Color3.fromRGB(255, 255, 255), -- tiles the current step proved
 	hl    = Color3.fromRGB(110, 190, 255), -- outline of the line being solved
 	probe = Color3.fromRGB(220, 120, 255), -- outline of a probed tile
+	search = Color3.fromRGB(255, 140, 40), -- live view: what a search guess implies
 }
 
 ------------------------------------------------------------------------------
@@ -799,29 +801,49 @@ local function liveWatch(ev)
 	coroutine.yield("step")
 end
 
-local function startLive(B)
-	S.rev = S.rev + 1
-	if not B then S.lv = nil return end
+-- The live solve waits for the real answer and reads the clues the way that
+-- answer did. Trying another reading first would "prove" tiles that are
+-- wrong for this board, and those look just like the answer on screen.
+local function beginLive(L, now)
+	local B = L.board
 	local g = givens(B)
 	local start = {}
 	for r = 1, B.R do
 		start[r] = {}
 		for c = 1, B.C do start[r][c] = g[r][c] or 0 end
 	end
-	local now = os.clock()
-	local L = { board = B, steps = 0, t0 = now, tNext = now, ev = { k = "s", grid = start, base = start } }
+	local flip = B.res and B.res.flip
+	L.waiting, L.t0, L.tNext = nil, now, now
+	L.ev = { k = "s", grid = start, base = start }
 	L.co = coroutine.create(function()
-		local res = solveOrders(B, g, start)
+		local res
+		if flip then
+			local rows, cols = orientClues(B, flip[1], flip[2])
+			res = Core.solve(rows, cols, B.R, B.C, g, 3000)
+		else
+			res = solveOrders(B, g, start)
+		end
 		Core.watch({ k = "d", status = res.status, grid = res.sol or res.sure, base = res.sure or start })
 		return res
 	end)
-	S.lv = L
+end
+
+local function startLive(B)
+	S.rev = S.rev + 1
+	if not B then S.lv = nil return end
+	S.lv = { board = B, steps = 0, waiting = true }
 end
 
 local function tickLive(now)
 	local L = S.lv
 	if not L then return end
 	if L.board ~= S.board then S.lv = nil; S.rev = S.rev + 1 return end
+	if L.waiting then
+		local B = L.board
+		if not B.res or (S.co and S.coBoard == B) then return end
+		beginLive(L, now)
+		S.rev = S.rev + 1
+	end
 	if not L.co then
 		if now - L.tEnd > CFG.liveHold then S.lv = nil; S.rev = S.rev + 1 end
 		return
@@ -1086,6 +1108,7 @@ local function liveText(B, L)
 	local head = string.format("live solve  step %d", L.steps)
 	local ev = L.ev
 	local k = ev.k
+	if L.waiting then return "live solve   waiting for the answer" end
 	if L.tEnd and k ~= "d" then return head .. "   stopped" end
 	if k == "s" then return head .. "   starting from the tiles already filled or crossed" end
 	if k == "r" or k == "c" then
@@ -1113,7 +1136,7 @@ local function liveText(B, L)
 		return head .. (ev.n == 1 and "   found an answer, checking it's the only one"
 			or "   found a second answer: the clues allow more than one")
 	elseif k == "d" then
-		local names = { unique = "solved", multiple = "ambiguous (yellow = guessed)",
+		local names = { unique = "solved", multiple = "ambiguous",
 			gaveup = "partial, gave up", none = "no solution" }
 		return head .. "   done: " .. (names[ev.status] or tostring(ev.status))
 	end
@@ -1135,7 +1158,7 @@ local function drawOutline(proj, B, L, y)
 	end
 	if ev then
 		if ev.k == "x" or ev.ok == false then col = COL.empty
-		elseif ev.k == "g" then col = COL.guess
+		elseif ev.k == "g" then col = COL.search
 		elseif ev.k == "t" or ev.k == "p" then col = COL.probe
 		else col = COL.hl end
 	end
@@ -1173,14 +1196,16 @@ local function render()
 	local nt, nl = 0, 0
 	local B = S.board
 	local L = S.lv
-	if L and L.board ~= B then L = nil end
+	if L and (L.board ~= B or L.waiting) then L = nil end
 	local y = B and B.top + 0.05
 	if S.enabled and B and (L or (B.res and (B.res.sol or B.res.sure))) then
-		-- live view: cells known in the step's grid but not yet proven are what
-		-- a trial (purple) or a guess (yellow) would make them
+		-- live view: proven fills are solid, like the answer. What a trial
+		-- (purple) or a search guess (orange) would imply is only outlined, so
+		-- it never looks like a tile to fill. Proven empties show as X only
+		-- while their step flashes, or with crosses on.
 		local lg = L and L.ev.grid
 		local lb = L and L.ev.base
-		local tent = L and (L.ev.k == "t" and COL.probe or COL.guess)
+		local tent = L and (L.ev.k == "t" and COL.probe or COL.search)
 		local fl = L and L.flash
 		local h = B.half * CFG.inset * 2
 		local vw, vh = vp and vp.X or 1e9, vp and vp.Y or 1e9
@@ -1199,12 +1224,14 @@ local function render()
 			if t.state == 0 then
 				if L then
 					local sv = lg and lg[t.r][t.c] or 0
-					if sv ~= 0 then
-						v = sv
-						if fl and fl[t.r * 4096 + t.c] then col = COL.flash
-						elseif lb and lb[t.r][t.c] == 0 then col = tent
-						elseif sv == 1 then col = COL.fill
-						else col = COL.empty end
+					local proven = not (lb and lb[t.r][t.c] == 0)
+					local flashing = fl and fl[t.r * 4096 + t.c]
+					if sv == 1 and proven then
+						v, col = 1, flashing and COL.flash or COL.fill
+					elseif sv == 1 then
+						v, col = 3, flashing and COL.flash or tent
+					elseif sv == 2 and proven and (flashing or S.showCross) then
+						v, col = 2, flashing and COL.flash or COL.empty
 					end
 				elseif t.want == 1 and (t.sure or guesses) then
 					v, col = 1, t.sure and COL.fill or COL.guess
@@ -1223,7 +1250,16 @@ local function render()
 				local dx, dy = proj(t.x - h, y, t.z + h)
 				if ax and bx and cx and dx then
 					local a, b, c, d = Vector2.new(ax, ay), Vector2.new(bx, by), Vector2.new(cx, cy), Vector2.new(dx, dy)
-					if v == 1 then
+					if v == 3 then
+						for q = 1, 4 do
+							nl = nl + 1
+							local l = getLn(nl)
+							local p = (q == 1 and a) or (q == 2 and b) or (q == 3 and c) or d
+							local p2 = (q == 1 and b) or (q == 2 and c) or (q == 3 and d) or a
+							l.From, l.To = p, p2
+							show(l, col)
+						end
+					elseif v == 1 then
 						nt = nt + 1
 						local t1 = getTri(nt)
 						t1.PointA, t1.PointB, t1.PointC = a, b, c

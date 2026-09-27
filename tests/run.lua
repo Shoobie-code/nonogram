@@ -220,7 +220,7 @@ local sawKinds, doneStatus = {}, nil
 for _ = 1, 600 do
 	frames(1)
 	local L = S.lv
-	if L then
+	if L and L.ev then
 		sawKinds[L.ev.k] = true
 		if L.ev.k == "d" then doneStatus = L.ev.status end
 	end
@@ -254,7 +254,7 @@ local amb, ambDone = {}, nil
 for _ = 1, 1500 do
 	frames(1)
 	local L = S.lv
-	if L then
+	if L and L.ev then
 		amb[L.ev.k] = true
 		if L.ev.k == "d" then ambDone = L.ev.status end
 	end
@@ -264,6 +264,37 @@ check(ambDone == "multiple", "ambiguous board: live solve ends ambiguous, got " 
 check(S.status == "ambiguous", "ambiguous board: overlay status, got " .. tostring(S.status))
 S.stop()
 check(#errs == 0, "no errors reported by the script: " .. table.concat(errs, " | "))
+
+-- the live view never shows a solid tile the answer disagrees with, even
+-- when the round says the clues are reversed (the solver tries a wrong
+-- reading first there)
+local liveWrong, liveBoards = 0, 0
+for seed = 1, 12 do
+	math.randomseed(100 + seed)
+	local n = math.random(6, 12)
+	local pic = {}
+	for r = 1, n do local row = {} for c = 1, n do row[c] = (math.random() < 0.6) and "1" or "0" end pic[r] = table.concat(row) end
+	buildWorld(pic)
+	serverData._attr.CurrentReversedCluesSetting = (seed % 2 == 0)
+	installGlobals()
+	S = load()
+	for _ = 1, 3000 do
+		frames(1)
+		local L, B = S.lv, S.board
+		if L and L.ev and B and B.res and B.res.sol and L.ev.grid then
+			local g, base, sol = L.ev.grid, L.ev.base, B.res.sol
+			for r = 1, B.R do for c = 1, B.C do
+				if g[r][c] == 1 and base[r][c] ~= 0 and B.res.sure[r][c] ~= 0 and sol[r][c] ~= 1 then liveWrong = liveWrong + 1 end
+			end end
+		end
+		if B and B.res and not S.lv then break end
+	end
+	if S.board and S.board.res then liveBoards = liveBoards + 1 end
+	S.stop()
+end
+check(liveBoards == 12, "live view boards solved")
+check(liveWrong == 0, "live view never shows a wrong solid tile (" .. liveWrong .. " seen)")
+check(#errs == 0, "no errors in the live view checks: " .. table.concat(errs, " | "))
 
 ------------------------------------------------------------------------------
 -- solver core, straight from the script
