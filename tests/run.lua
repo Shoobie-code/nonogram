@@ -347,6 +347,81 @@ do
 	check(#errs == 0, "no errors while playing: " .. table.concat(errs, " | "))
 end
 
+-- auto fill plays boards that logic alone can't finish: it has to guess.
+-- A tiny game: WASD walks (camera looks along +Z), F / Q switch fill mode,
+-- standing on a tile in fill mode fills it, a wrong tile is a 2 s timeout.
+local function playBoard(pic, limit)
+	buildWorld(pic)
+	installGlobals()
+	local held, timeoutUntil, misses, gameT = {}, 0, 0, 0
+	keypress = function(vk)
+		held[vk] = true
+		if vk == 0x46 and lp._attr.FillMode == -1 then lp._attr.FillMode = 1 end
+		if vk == 0x51 and lp._attr.FillMode == 1 then lp._attr.FillMode = -1 end
+	end
+	keyrelease = function(vk) held[vk] = nil end
+	local S = load()
+	S.live(false)
+	S.autofill(true)
+	local function won()
+		for r = 1, N do for c = 1, N do
+			if PIC[r]:sub(c, c) == "1" and not tilesByRC[r][c]._attr.Filled then return false end
+		end end
+		return true
+	end
+	local dt = 1 / 60
+	while gameT < limit and not won() do
+		gameT = gameT + dt
+		local dx, dz = 0, 0
+		if held[0x57] then dz = dz + 1 end
+		if held[0x53] then dz = dz - 1 end
+		if held[0x44] then dx = dx - 1 end
+		if held[0x41] then dx = dx + 1 end
+		local m = math.sqrt(dx * dx + dz * dz)
+		local p = hrp.Position
+		if m > 0 then p = V3(p.X + dx / m * 16 * dt, p.Y, p.Z + dz / m * 16 * dt); hrp.Position = p end
+		lp._attr.Timeout = (gameT < timeoutUntil) and (timeoutUntil - gameT) or 0
+		local c, r = math.floor(p.X / 5 + 0.5), math.floor(p.Z / 5 + 0.5)
+		local t = tilesByRC[r] and tilesByRC[r][c]
+		if t and lp._attr.FillMode == 1 and gameT >= timeoutUntil and not t._attr.Solved
+			and math.abs(p.X - c * 5) < 2.5 and math.abs(p.Z - r * 5) < 2.5 then
+			if PIC[r]:sub(c, c) == "1" then
+				t._attr.Solved, t._attr.Filled = true, true
+			else
+				timeoutUntil, misses = gameT + 2, misses + 1
+			end
+		end
+		frames(1, dt)
+	end
+	local A = S.autoState
+	local res = { won = won(), t = gameT, misses = misses, guesses = A.guesses or 0, wrong = A.misses or 0,
+		on = A.on, benched = A.benched }
+	S.stop()
+	keypress, keyrelease = function() end, function() end
+	return res
+end
+
+do
+	-- one tile per row and column: no line ever helps, every fill is a guess
+	local r1 = playBoard({ "00100", "10000", "00001", "01000", "00010" }, 240)
+	check(r1.won, string.format("guessing finishes a board with no logic (%.0fs, %d guesses, %d wrong)", r1.t, r1.guesses, r1.wrong))
+	check(r1.guesses > 0, "it guessed")
+	check(r1.on and not r1.benched, "wrong guesses don't make it sit out the board")
+	check(r1.misses == r1.wrong, "every timeout was a guess it knew was one (" .. r1.misses .. " timeouts, " .. r1.wrong .. " wrong guesses)")
+	-- random boards whose clues allow more than one answer
+	local wins, games = 0, 0
+	for seed = 1, 5 do
+		math.randomseed(300 + seed)
+		local pic = {}
+		for r = 1, 8 do local row = {} for c = 1, 8 do row[c] = (math.random() < 0.5) and "1" or "0" end pic[r] = table.concat(row) end
+		local rr = playBoard(pic, 300)
+		games = games + 1
+		if rr.won and rr.misses == rr.wrong then wins = wins + 1 end
+	end
+	check(wins == games, "random ambiguous boards all finished (" .. wins .. "/" .. games .. ")")
+	check(#errs == 0, "no errors while guessing: " .. table.concat(errs, " | "))
+end
+
 ------------------------------------------------------------------------------
 -- solver core, straight from the script
 ------------------------------------------------------------------------------

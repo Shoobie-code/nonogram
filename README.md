@@ -6,7 +6,7 @@
 - **F7**: arm or disarm auto fill
 - **F6**: turn the live solving view on or off
 
-Auto fill is persistent. Once it's armed, only F7 (or `_G.nonogram.autofill(false)` / `.stop()`) disarms it. When something goes wrong (mistakes, getting stuck, fill mode that won't switch, errors), it backs off or sits out the current board, then resumes on the next one. Re-running the script keeps it armed. Set `CFG.autoArm = true` to arm it on start. `_G.nonogram.autoinfo()` shows what it's doing.
+Auto fill is persistent. Once it's armed, only F7 (or `_G.nonogram.autofill(false)` / `.stop()`) disarms it. When something goes wrong (mistakes, getting stuck, fill mode that won't switch, errors), it backs off or sits out the current board, then resumes on the next one. Re-running the script keeps it armed. When no sure tile is left, it guesses: it fills the open tile most likely to be filled, re-solves with what that shows, and repeats. A wrong guess costs one mistake timeout, and that tile then counts as known empty. Set `CFG.autoGuess = false` to turn guessing off. Set `CFG.autoArm = true` to arm it on start. `_G.nonogram.autoinfo()` shows what it's doing.
 
 The live solving view is on by default. The solver records every step while it solves a board, and the view plays those steps back on the overlay as soon as the solve finishes (a moment after the board spawns):
 - a blue outline marks the row or column being read
@@ -26,4 +26,4 @@ The header of the script lists the full console API.
 lua5.1 tests/run.lua
 ```
 
-The tests mock the Roblox and Matcha APIs, so they run offline. They check the solver, the live view, and that auto fill stays armed through trouble.
+The tests mock the Roblox and Matcha APIs, so they run offline. They check the solver, the live view, guessing (auto fill plays simulated boards that need it), and that auto fill stays armed through trouble.

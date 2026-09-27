@@ -36,6 +36,13 @@
     fill-mode trouble and errors make it back off or sit out the current board,
     never disarm. Re-running the script keeps it armed.
 
+    When no sure tile is left (the clues allow more than one answer, or the
+    solver gave up on a big board), auto fill guesses: it fills the open tile
+    most likely to be filled (drawn yellow), waits for the board to be solved
+    again with what that showed, and repeats. A wrong guess costs one mistake
+    timeout; that tile is then known empty and never counts toward "two
+    mistakes". CFG.autoGuess = false turns guessing off.
+
     Colours:  green  = fill this tile (walk over it in fill mode)
               yellow = fill, but only a best guess (clues are hidden or ambiguous)
               red x  = must stay empty (only with crosses on)
@@ -49,7 +56,10 @@ local CFG = {
 	autoArm   = false,  -- arm auto fill as soon as the script starts
 	                    -- (re-running the script keeps it armed either way)
 	autoSprint = true,  -- hold shift while walking when the round allows sprinting
-	autoGuesses = false, -- auto fill also steps on guessed tiles (costs lives when wrong)
+	autoGuess = true,    -- when no sure tile is left, guess: fill the open tile most
+	                     -- likely filled, one at a time, and re-solve with what it shows
+	                     -- (a wrong guess costs a mistake timeout)
+	autoGuesses = false, -- also step on every guessed tile at once (costs lives when wrong)
 	pace      = 0.1,    -- seconds between tile-state scan ticks
 	budget    = 0.002,  -- seconds of attribute reads allowed per scan tick
 	statePoll = 0.5,    -- seconds between round-state reads (ServerData attrs cost ~1ms)
@@ -310,6 +320,89 @@ local function solveLine(line, clue, n)
 	return out
 end
 Core.solveLine = solveLine
+
+-- Chance each cell of a line is filled, counting every arrangement of the
+-- clue that fits the line as equally likely. Returns nil for a missing or
+-- shuffled clue, or when nothing fits. Used to pick the best guess.
+function Core.lineProb(line, clue, n)
+	if not clue then return nil end
+	local a = prepClue(clue, n)
+	if a.set then return nil end
+	local lo, hi, k = a.lo, a.hi, a.k
+	local pe = { [0] = 0 }
+	for i = 1, n do pe[i] = pe[i - 1] + (line[i] == 2 and 1 or 0) end
+	local function noEmpty(s, e) return pe[e] - pe[s - 1] == 0 end
+	-- F[i][j]: ways to fit blocks 1..j in cells 1..i
+	local F = {}
+	for i = 0, n do F[i] = {} for j = 0, k do F[i][j] = 0 end end
+	F[0][0] = 1
+	for i = 1, n do
+		for j = 0, k do
+			local w = (line[i] ~= 1) and F[i - 1][j] or 0
+			if j >= 1 then
+				for L = lo[j], hi[j] do
+					local s = i - L + 1
+					if s < 1 or not noEmpty(s, i) then break end
+					if s == 1 then
+						if j == 1 then w = w + 1 end
+					elseif line[s - 1] ~= 1 then
+						w = w + F[s - 2][j - 1]
+					end
+				end
+			end
+			F[i][j] = w
+		end
+	end
+	local total = F[n][k]
+	if total <= 0 then return nil end
+	-- G[i][j]: ways to fit blocks j..k in cells i..n
+	local G = {}
+	for i = 1, n + 2 do G[i] = {} for j = 1, k + 1 do G[i][j] = 0 end end
+	G[n + 1][k + 1], G[n + 2][k + 1] = 1, 1
+	for i = n, 1, -1 do
+		for j = k + 1, 1, -1 do
+			local w = (line[i] ~= 1) and G[i + 1][j] or 0
+			if j <= k then
+				for L = lo[j], hi[j] do
+					local e = i + L - 1
+					if e > n or not noEmpty(i, e) then break end
+					if e == n then
+						if j == k then w = w + 1 end
+					elseif line[e + 1] ~= 1 then
+						w = w + G[e + 2][j + 1]
+					end
+				end
+			end
+			G[i][j] = w
+		end
+	end
+	local diff = {}
+	for i = 1, n + 1 do diff[i] = 0 end
+	for j = 1, k do
+		for s = 1, n do
+			local before
+			if s == 1 then before = (j == 1) and 1 or 0
+			else before = (line[s - 1] ~= 1) and F[s - 2][j - 1] or 0 end
+			if before > 0 then
+				for L = lo[j], hi[j] do
+					local e = s + L - 1
+					if e > n or not noEmpty(s, e) then break end
+					local after
+					if e == n then after = (j == k) and 1 or 0
+					else after = (line[e + 1] ~= 1) and G[e + 2][j + 1] or 0 end
+					local w = before * after
+					if w > 0 then diff[s] = diff[s] + w; diff[e + 1] = diff[e + 1] - w end
+				end
+			end
+		end
+	end
+	local p, run = {}, 0
+	for c = 1, n do
+		run = run + diff[c]
+		p[c] = math.max(0, math.min(1, run / total))
+	end
+	return p
+end
 
 local function copyGrid(g, R, C)
 	local o = {}
@@ -1143,7 +1236,7 @@ local function unchanged(cf, vp, fov)
 	local p, l = cf.Position, cf.LookVector
 	local B = S.board
 	local key = { p.X, p.Y, p.Z, l.X, l.Y, l.Z, vp and vp.X or 0, vp and vp.Y or 0, fov or 0,
-		S.rev, S.status, B or false, B and B.res or false, S.enabled, S.showCross, S.autoTag or false, S.liveOn, S.lv or false }
+		S.rev, S.status, B or false, B and B.res or false, S.enabled, S.showCross, S.autoTag or false, S.liveOn, S.lv or false, S.guessTile or false }
 	local old, same = S.drawnKey, true
 	if not old then same = false
 	else for i = 1, #key do if key[i] ~= old[i] then same = false break end end end
@@ -1286,6 +1379,8 @@ local function render()
 					elseif tv == 2 and flashing then
 						v, col = 2, COL.flash -- a tile tried / guessed as empty
 					end
+				elseif t == S.guessTile then
+					v, col = 1, COL.guess -- auto fill is guessing this one
 				elseif t.want == 1 and (t.sure or guesses) then
 					v, col = 1, t.sure and COL.fill or COL.guess
 				elseif S.showCross and t.want == 2 and t.sure then
@@ -1399,7 +1494,7 @@ end
 ------------------------------------------------------------------------------
 local VK = { W = 0x57, A = 0x41, S = 0x53, D = 0x44, Q = 0x51, F = 0x46, SHIFT = 0xA0 }
 local DR, DC = { 1, -1, 0, 0 }, { 0, 0, 1, -1 }
-local A = { on = false, held = {}, phase = "idle", tCtl = 0 }
+local A = { on = false, held = {}, phase = "idle", tCtl = 0, badGuess = {} }
 S.autoState = A
 
 local function akey(vk, down)
@@ -1435,7 +1530,7 @@ local function fillMode()
 	return lp and attr(lp, "FillMode")
 end
 
-local function fillable(t) return t.want == 1 and (t.sure or CFG.autoGuesses) end
+local function fillable(t) return (t.want == 1 and (t.sure or CFG.autoGuesses)) or t == A.guess end
 -- safe to stand on with fill mode on
 local function onSafe(t) return t.state == 1 or (t.state == 0 and fillable(t)) end
 -- "passed" = stood on with fill mode on; wait for the scanner to confirm
@@ -1671,6 +1766,76 @@ local function tickMove(now, p)
 	if A.axisX then steer(sp, sl, sprint) else steer(sl, sp, sprint) end
 end
 
+-- The open tile most likely to be filled. Each line counts every way its
+-- clue still fits the known tiles (see Core.lineProb); a tile's row and
+-- column chances are combined. Tiles a wrong guess showed empty are skipped.
+local function pickGuess(B)
+	local res = B.res
+	if not (res and res.flip) then return nil end
+	local rows, cols = orientClues(B, res.flip[1], res.flip[2])
+	local grid, openR, openC = {}, {}, {}
+	for r = 1, B.R do
+		grid[r] = {}
+		for c = 1, B.C do
+			local t = B.at[r][c]
+			local v = t.state ~= 0 and t.state or (res.sure and res.sure[r][c]) or 0
+			grid[r][c] = v
+			if v == 0 then openR[r], openC[c] = true, true end
+		end
+	end
+	local pr, pc = {}, {}
+	for r in pairs(openR) do pr[r] = Core.lineProb(grid[r], rows[r], B.C) end
+	for c in pairs(openC) do
+		local line = {}
+		for r = 1, B.R do line[r] = grid[r][c] end
+		pc[c] = Core.lineProb(line, cols[c], B.R)
+	end
+	local best, bp = nil, 0
+	for _, t in ipairs(B.cells) do
+		if grid[t.r][t.c] == 0 and not A.badGuess[t] then
+			local a = pr[t.r] and pr[t.r][t.c]
+			local b = pc[t.c] and pc[t.c][t.r]
+			local q
+			if a and b then
+				local num = a * b
+				local den = num + (1 - a) * (1 - b)
+				q = den > 0 and num / den or 0
+			else
+				q = a or b or 0.5
+			end
+			if t.want == 1 then q = q + 1e-6 end -- ties go to the search's answer
+			if q > bp then best, bp = t, q end
+		end
+	end
+	return best, bp
+end
+
+-- Nothing sure left to fill. Returns true when it is guessing (or waiting
+-- for the last guess to show its result).
+local function tryGuess(B, now)
+	if not CFG.autoGuess then return false end
+	local g = A.guess
+	if g then
+		-- wait until the tile shows its state and the board is solved again
+		-- with it; a guess that never registers is dropped after a while
+		if (g.state == 0 or B.res == A.guessRes or S.co) and now - A.guessAt < 8 then
+			autoWait(0.25, "guessed, waiting for the result")
+			return true
+		end
+		A.guess, S.guessTile = nil, nil
+	end
+	if S.co then autoWait(0.25, "waiting for the solver") return true end
+	local t, q = pickGuess(B)
+	if not t then return false end
+	A.guess, A.guessRes, A.guessAt, A.guessStepAt = t, B.res, now, nil
+	A.guesses = (A.guesses or 0) + 1
+	S.guessTile = t
+	autoSay(string.format("no sure tiles left, guessing (%d%% likely)", math.floor(q * 100 + 0.5)))
+	A.tag = "guessing"
+	goPlan()
+	return true
+end
+
 local function tickPlan(now, p)
 	local B = S.board
 	if not (B and B.res and (B.res.sol or B.res.sure)) then A.tag = "waiting for the answer" return end
@@ -1679,12 +1844,14 @@ local function tickPlan(now, p)
 	if m == nil then autoWait(1, "can't read the fill mode") return end
 	if m ~= -1 and m ~= 1 then startSwitch(-1) return end -- never walk in cross mode
 	local cur = cellAt(B, p.X, p.Z)
-	local left, waiting, unsure = 0, 0, 0
+	local left, waiting, open = 0, 0, 0
 	for _, t in ipairs(B.cells) do
-		if t.state == 0 and t.want == 1 then
-			if not fillable(t) then unsure = unsure + 1
-			elseif isTarget(t, now) then left = left + 1
-			else waiting = waiting + 1 end
+		if t.state == 0 then
+			if fillable(t) then
+				if isTarget(t, now) then left = left + 1 else waiting = waiting + 1 end
+			elseif not t.sure then
+				open = open + 1 -- not known yet: a guess, or no answer at all
+			end
 		end
 	end
 	A.left = left + waiting
@@ -1695,7 +1862,8 @@ local function tickPlan(now, p)
 			return
 		end
 		if waiting > 0 then autoWait(0.3, "checking the last tiles") return end
-		local tag = unsure > 0 and "sure tiles done, waiting for more clues" or "board done, waiting for the next round"
+		if open > 0 and tryGuess(B, now) then return end
+		local tag = open > 0 and "sure tiles done, waiting for more clues" or "board done, waiting for the next round"
 		autoSay(tag)
 		autoWait(0.5, tag)
 		return
@@ -1750,6 +1918,7 @@ local function autoNewBoard(B)
 	A.board, A.phase, A.nextFn = B, "plan", nil
 	A.mistakes, A.stuck, A.stuckTotal, A.switchFails, A.errors = 0, 0, 0, 0, 0
 	A.inTimeout, A.away, A.lastSaid, A.inCell, A.benched = false, false, nil, nil, nil
+	A.guess, A.guessStepAt, A.badGuess, A.guesses, A.misses, S.guessTile = nil, nil, {}, 0, 0, nil
 	A.hrp, A.lp, A.speed = nil, nil, 0
 	local sd = workspace:FindFirstChild("ServerData")
 	A.noWalk = sd and attr(sd, "CurrentDisableWalkSetting") == true
@@ -1798,8 +1967,20 @@ local function autoTick()
 		local to = lp and attr(lp, "Timeout")
 		local inTo = type(to) == "number" and to > 0
 		if inTo and not A.inTimeout then
-			A.mistakes = (A.mistakes or 0) + 1
-			if A.mistakes >= 2 and not A.benched then autoBench("two mistakes") end
+			local g = A.guess
+			-- on the guess tile (the game fills the moment fill mode goes on)
+			-- or just off it: the guess was wrong
+			if g and (cellAt(B, p.X, p.Z) == g or (A.guessStepAt and now - A.guessStepAt < 4)) then
+				-- a wrong guess: part of guessing, not a mistake. The tile is
+				-- empty, so the solver gets to use that too.
+				A.badGuess[g] = true
+				A.misses = (A.misses or 0) + 1
+				if g.state == 0 then g.state = 2; B.dirty = true; S.rev = S.rev + 1 end
+				A.guess, S.guessTile = nil, nil
+			else
+				A.mistakes = (A.mistakes or 0) + 1
+				if A.mistakes >= 2 and not A.benched then autoBench("two mistakes") end
+			end
 		end
 		A.inTimeout = inTo
 		local ps = lp and attr(lp, "PlayingState")
@@ -1808,9 +1989,17 @@ local function autoTick()
 	end
 	if A.inTimeout or A.away then
 		releaseMove()
-		A.phase = "plan"
 		A.tag = A.inTimeout and "mistake timeout, waiting" or "not playing this round"
 		S.autoTag = A.tag
+		-- still standing on the wrong tile with fill mode on: switch it off
+		-- now, or the tile fills wrong again the moment the timeout ends
+		if A.inTimeout and (A.mode == 1 or A.phase == "switch") then
+			if A.phase ~= "switch" then startSwitch(-1, function() A.phase = "plan" end) end
+			tickSwitch(now)
+			if A.phase == "wait" then A.phase = "plan" end -- keep retrying while it lasts
+			return
+		end
+		A.phase = "plan"
 		return
 	end
 	if A.benched and A.phase ~= "switch" then
@@ -1830,7 +2019,10 @@ local function autoTick()
 		elseif fillable(cur) and cur.state == 0 then
 			-- the game raycasts at 30 Hz: ~70 ms on a tile is enough to fill it
 			if A.inCell ~= cur then A.inCell, A.inSince = cur, now
-			elseif now - A.inSince > 0.07 then cur.passed = now end
+			elseif now - A.inSince > 0.07 then
+				cur.passed = now
+				if cur == A.guess and not A.guessStepAt then A.guessStepAt = now end
+			end
 		end
 	end
 	local ph = A.phase
@@ -1843,7 +2035,10 @@ local function autoTick()
 		if ((A.speed or 0) < 0.6 and now - A.tSettle > 0.06) or now - A.tSettle > 0.4 then runNext() end
 	elseif ph == "dwell" then
 		if now - A.tDwell > 0.12 then
-			if cur and fillable(cur) then cur.passed = now end
+			if cur and fillable(cur) then
+				cur.passed = now
+				if cur == A.guess and not A.guessStepAt then A.guessStepAt = now end
+			end
 			goPlan()
 		end
 	end
@@ -1883,8 +2078,8 @@ S.autoinfo = function()
 	if not A.on then print("[nonogram] auto fill is off (F7 arms it)") return end
 	print(string.format("[nonogram] auto fill armed  phase %s  [%s]  fill mode %s",
 		tostring(A.phase), tostring(A.tag), tostring(A.mode)))
-	print(string.format("[nonogram] this board: mistakes %d  stuck %d  switch fails %d  errors %d  %s",
-		A.mistakes or 0, A.stuckTotal or 0, A.switchFails or 0, A.errors or 0,
+	print(string.format("[nonogram] this board: guesses %d (wrong %d)  mistakes %d  stuck %d  switch fails %d  errors %d  %s",
+		A.guesses or 0, A.misses or 0, A.mistakes or 0, A.stuckTotal or 0, A.switchFails or 0, A.errors or 0,
 		A.benched and ("sitting out: " .. A.benched) or "working"))
 end
 ------------------------------------------------------------------------------
