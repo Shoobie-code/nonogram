@@ -281,10 +281,10 @@ for seed = 1, 12 do
 	for _ = 1, 3000 do
 		frames(1)
 		local L, B = S.lv, S.board
-		if L and L.ev and B and B.res and B.res.sol and L.ev.grid then
-			local g, base, sol = L.ev.grid, L.ev.base, B.res.sol
+		if L and L.grid and B and B.res and B.res.sol then
+			local g, sol = L.grid, B.res.sol
 			for r = 1, B.R do for c = 1, B.C do
-				if g[r][c] == 1 and base[r][c] ~= 0 and B.res.sure[r][c] ~= 0 and sol[r][c] ~= 1 then liveWrong = liveWrong + 1 end
+				if g[r][c] == 1 and sol[r][c] ~= 1 then liveWrong = liveWrong + 1 end
 			end end
 		end
 		if B and B.res and not S.lv then break end
@@ -295,6 +295,57 @@ end
 check(liveBoards == 12, "live view boards solved")
 check(liveWrong == 0, "live view never shows a wrong solid tile (" .. liveWrong .. " seen)")
 check(#errs == 0, "no errors in the live view checks: " .. table.concat(errs, " | "))
+
+-- playing a board: fill its tiles while the live view runs and F6 is
+-- pressed. Re-solves must finish, the answer must stay right, and there is
+-- never more than one solver coroutine alive (Matcha broke with two).
+do
+	local realCreate, alive, maxAlive = coroutine.create, {}, 0
+	coroutine.create = function(f)
+		local co = realCreate(f)
+		alive[co] = true
+		return co
+	end
+	local function countAlive()
+		local n = 0
+		for co in pairs(alive) do
+			if coroutine.status(co) == "dead" then alive[co] = nil else n = n + 1 end
+		end
+		return n
+	end
+	local stuck, wrongAns = 0, 0
+	for seed = 1, 4 do
+		math.randomseed(200 + seed)
+		local n = 12
+		local pic = {}
+		for r = 1, n do local row = {} for c = 1, n do row[c] = (math.random() < 0.55) and "1" or "0" end pic[r] = table.concat(row) end
+		buildWorld(pic)
+		installGlobals()
+		S = load()
+		local k = 0
+		for r = 1, n do for c = 1, n do
+			if pic[r]:sub(c, c) == "1" then
+				local t = tilesByRC[r][c]
+				t._attr.Solved, t._attr.Filled = true, true
+				k = k + 1
+				if k % 7 == 0 then S.live(false); frames(2); S.live(true) end
+				for _ = 1, 3 do frames(1); maxAlive = math.max(maxAlive, countAlive()) end
+			end
+		end end
+		for _ = 1, 400 do frames(1); maxAlive = math.max(maxAlive, countAlive()) end
+		if S.status == "solving" then stuck = stuck + 1 end
+		local B = S.board
+		for _, t in ipairs(B.cells) do
+			if t.want ~= ((pic[t.r]:sub(t.c, t.c) == "1") and 1 or 2) then wrongAns = wrongAns + 1 end
+		end
+		S.stop()
+	end
+	coroutine.create = realCreate
+	check(maxAlive <= 1, "never more than one solver coroutine alive (saw " .. maxAlive .. ")")
+	check(stuck == 0, "no board left stuck on solving")
+	check(wrongAns == 0, "answers right after playing the board (" .. wrongAns .. " wrong tiles)")
+	check(#errs == 0, "no errors while playing: " .. table.concat(errs, " | "))
+end
 
 ------------------------------------------------------------------------------
 -- solver core, straight from the script
