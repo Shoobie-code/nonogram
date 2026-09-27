@@ -4,9 +4,17 @@
 
 - **F8**: show or hide the overlay
 - **F7**: arm or disarm auto fill
-- **F6**: replay how the board was solved
+- **F6**: turn the live solving view on or off
 
 Auto fill is persistent. Once it's armed, only F7 (or `_G.nonogram.autofill(false)` / `.stop()`) disarms it. When something goes wrong (mistakes, getting stuck, fill mode that won't switch, errors), it backs off or sits out the current board, then resumes on the next one. Re-running the script keeps it armed. Set `CFG.autoArm = true` to arm it on start. `_G.nonogram.autoinfo()` shows what it's doing.
+
+The live solving view is on by default. When a board spawns, it's solved right on the overlay, one step at a time, as it happens:
+- a blue outline marks the row or column being read
+- white flashes mark the tiles that step proves
+- purple marks what a tile would imply when the solver tries it both ways
+- yellow marks guesses and dead ends once logic runs out
+
+Turning the view on with F6 solves the current board live again. It stays on for every board, and across re-runs, until you press F6 again. The answer overlay and auto fill use a separate full-speed solve, so they never wait for the live view.
 
 The header of the script lists the full console API.
 
@@ -16,4 +24,4 @@ The header of the script lists the full console API.
 lua5.1 tests/run.lua
 ```
 
-The tests mock the Roblox and Matcha APIs, so they run offline. They check the solver and that auto fill stays armed through trouble.
+The tests mock the Roblox and Matcha APIs, so they run offline. They check the solver, the live view, and that auto fill stays armed through trouble.

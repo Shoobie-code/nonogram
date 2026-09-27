@@ -11,15 +11,23 @@
         _G.nonogram.toggle()        show / hide the overlay
         _G.nonogram.autofill()      arm / disarm auto fill (same as F7)
         _G.nonogram.autoinfo()      print what auto fill is doing and why
-        _G.nonogram.replay()        replay the solving process (same as F6)
-        _G.nonogram.process(false)  stop replaying every new board's solve
+        _G.nonogram.live()          live solving view on / off (same as F6)
+        _G.nonogram.replay()        watch the current board get solved live again
         _G.nonogram.crosses(true)   also mark the tiles that must stay empty
         _G.nonogram.rescan()        re-read the board and solve again
         _G.nonogram.info()          print the current solve summary
         _G.nonogram.dump()          print the solution as ascii
         _G.nonogram.stop()          tear everything down
-    F8 toggles the overlay, F7 arms / disarms auto fill, F6 replays how the
-    current board was solved.
+    F8 toggles the overlay, F7 arms / disarms auto fill, F6 turns the live
+    solving view on / off.
+
+    Live solving view (on by default): every new board is solved in front of
+    you, step by step, as it happens: the row or column being read (blue
+    outline), the tiles it proves (white flash), tiles tried both ways when no
+    line helps (purple), guesses and dead ends when logic runs out (yellow).
+    It starts as soon as a board spawns; turning it on with F6 solves the
+    current board live again. It stays on across rounds and re-runs until F6
+    turns it off. The answer and auto fill never wait for it.
 
     Auto fill is persistent: once armed it only disarms on F7 (or .autofill()
     / .stop()). Round ends, finished boards, timeouts, mistakes, getting stuck,
@@ -29,7 +37,9 @@
     Colours:  green  = fill this tile (walk over it in fill mode)
               yellow = fill, but only a best guess (clues are hidden or ambiguous)
               red x  = must stay empty (only with crosses on)
-]]
+    Live view:    green / red x = proven,  white = proven by this step,
+                  purple = what trying a tile would imply,
+                  yellow = what a guess implies]]
 
 local CFG = {
 	togglekey = 0x77,   -- F8: overlay
@@ -50,13 +60,12 @@ local CFG = {
 	inset     = 0.42,   -- fraction of the tile's half-width the marks cover
 	fillAlpha = 0.45,
 	crosses   = false,
-	showProcess = true, -- replay how each new board gets solved
-	replaykey = 0x75,   -- F6: replay the solving process
-	playTime  = 8,      -- seconds a replay takes (steps are spread over it)
-	playMin   = 0.003,  -- fastest step
-	playMax   = 0.12,   -- slowest step
-	playLive  = 0.02,   -- step pace while the solver is still running
-	playHold  = 1.2,    -- seconds the last step stays up
+	live      = true,   -- live solving view: watch every new board get solved
+	livekey   = 0x75,   -- F6: live solving view on / off (a re-run keeps the choice)
+	livePace  = 0.07,   -- seconds per solving step when a live solve starts
+	liveHalf  = 4,      -- the pace doubles every this many seconds, so big boards finish
+	liveSlice = 0.004,  -- seconds of live solving per frame at most
+	liveHold  = 1.5,    -- seconds the finished live solve stays up
 }
 
 local COL = {
@@ -75,6 +84,7 @@ local COL = {
 local prev = _G.nonogram
 _G.nonogram = nil
 local wasArmed = prev and prev.autoState and prev.autoState.on == true
+local wasLive = prev and prev.liveOn
 if prev then
 	pcall(function() if prev._r then prev._r:Disconnect() end end)
 	if prev.autoState then for vk in pairs(prev.autoState.held or {}) do pcall(keyrelease, vk) end end
@@ -92,7 +102,7 @@ local Players = svc("Players")
 -- a clue is { nums = {..}, unordered = bool }; a number of -1 means hidden
 -- (any length). A nil clue leaves its line unconstrained.
 ------------------------------------------------------------------------------
-local Core = { pause = nil }
+local Core = { pause = nil, watch = nil }
 
 -- One arrangement of block lengths. Adds every feasible filled cell to diff
 -- and every feasible empty cell to canE; returns false if nothing fits.
@@ -305,20 +315,23 @@ local function copyGrid(g, R, C)
 end
 Core.copyGrid = copyGrid
 
--- Solve trace for the "solving process" replay: one step per line or probe
--- that proved cells. Only the main grid is recorded, never probe trials.
-local function record(P, step)
-	local tr = P.trace
-	if not tr or tr.full then return end
-	if #tr >= 40000 then tr.full = true return end
-	tr[#tr + 1] = step
-end
+-- Live view hook. When Core.watch is set it is called at every solving step
+-- with an event: { k = kind, grid = the grid being worked on, base = the
+-- grid that is proven (cells known in grid but not in base are tentative),
+-- cells = keys r * 4096 + c of the tiles this step touched, ... }. Kinds:
+--   r / c  a row / column (i) proved tiles        x  line i (line "r"/"c") can't fit
+--   t      probe trial: tile r,c tried as v (1 fill, 2 empty), ok = no contradiction
+--   p      both trials of tile r,c agree: the tiles in cells are proven
+--   g      search guess: tile r,c set to v at depth, ok = still consistent
+--   f      search found answer number n
+-- The live view yields inside the hook, so the solve runs at its pace.
+local function emit(ev) local w = Core.watch; if w then w(ev) end end
 
 -- Runs line solving to a fixpoint. Returns false on a contradiction.
--- rec: this is the main grid, so proved cells go into the trace.
-local function propagate(P, grid, dirtyR, dirtyC, rec)
+-- main: this is the proven grid, so its steps go to the live view.
+local function propagate(P, grid, dirtyR, dirtyC, main)
 	local R, C = P.R, P.C
-	rec = rec and P.trace ~= nil
+	local rec = main and Core.watch ~= nil
 	local qR, qC, inR, inC = {}, {}, {}, {}
 	for r = 1, R do if dirtyR == nil or dirtyR[r] then qR[#qR + 1] = r; inR[r] = true end end
 	for c = 1, C do if dirtyC == nil or dirtyC[c] then qC[#qC + 1] = c; inC[c] = true end end
@@ -331,31 +344,37 @@ local function propagate(P, grid, dirtyR, dirtyC, rec)
 			local row = grid[r]
 			for c = 1, C do line[c] = row[c] end
 			local out = solveLine(line, P.rows[r], C)
-			if not out then return false end
+			if not out then
+				if rec then emit({ k = "x", line = "r", i = r, grid = grid, base = grid }) end
+				return false
+			end
 			local cells
 			for c = 1, C do
 				if row[c] == 0 and out[c] ~= 0 then
 					row[c] = out[c]
-					if rec then cells = cells or {}; cells[#cells + 1] = r; cells[#cells + 1] = c; cells[#cells + 1] = out[c] end
+					if rec then cells = cells or {}; cells[#cells + 1] = r * 4096 + c end
 					if not inC[c] then inC[c] = true; qC[#qC + 1] = c end
 				end
 			end
-			if cells then record(P, { k = "r", i = r, cells = cells }) end
+			if cells then emit({ k = "r", i = r, cells = cells, grid = grid, base = grid }) end
 			for c = 1, C do line[c] = nil end
 		else
 			local c = table.remove(qC); inC[c] = nil
 			for r = 1, R do line[r] = grid[r][c] end
 			local out = solveLine(line, P.cols[c], R)
-			if not out then return false end
+			if not out then
+				if rec then emit({ k = "x", line = "c", i = c, grid = grid, base = grid }) end
+				return false
+			end
 			local cells
 			for r = 1, R do
 				if grid[r][c] == 0 and out[r] ~= 0 then
 					grid[r][c] = out[r]
-					if rec then cells = cells or {}; cells[#cells + 1] = r; cells[#cells + 1] = c; cells[#cells + 1] = out[r] end
+					if rec then cells = cells or {}; cells[#cells + 1] = r * 4096 + c end
 					if not inR[r] then inR[r] = true; qR[#qR + 1] = r end
 				end
 			end
-			if cells then record(P, { k = "c", i = c, cells = cells }) end
+			if cells then emit({ k = "c", i = c, cells = cells, grid = grid, base = grid }) end
 			for r = 1, R do line[r] = nil end
 		end
 	end
@@ -387,13 +406,16 @@ local function probe(P, grid)
 						t[r][c] = v
 						ok[v] = propagate(P, t, { [r] = true }, { [c] = true })
 						tt[v] = t
+						if Core.watch then
+							emit({ k = "t", r = r, c = c, v = v, ok = ok[v], cells = { r * 4096 + c }, grid = t, base = grid })
+						end
 					end
 					if not ok[1] and not ok[2] then return false end
 					local dR, dC, cells = {}, {}, {}
 					if ok[1] ~= ok[2] then
 						grid[r][c] = ok[1] and 1 or 2
 						dR[r], dC[c] = true, true
-						cells[1], cells[2], cells[3] = r, c, grid[r][c]
+						cells[1] = r * 4096 + c
 					else
 						local a, b = tt[1], tt[2]
 						for rr = 1, R do
@@ -402,13 +424,13 @@ local function probe(P, grid)
 								if rg[cc] == 0 and ra[cc] ~= 0 and ra[cc] == rb[cc] then
 									rg[cc] = ra[cc]
 									dR[rr], dC[cc] = true, true
-									cells[#cells + 1] = rr; cells[#cells + 1] = cc; cells[#cells + 1] = ra[cc]
+									cells[#cells + 1] = rr * 4096 + cc
 								end
 							end
 						end
 					end
 					if next(dR) then
-						if P.trace then record(P, { k = "p", i = r, j = c, cells = cells }) end
+						if Core.watch then emit({ k = "p", r = r, c = c, cells = cells, grid = grid, base = grid }) end
 						if not propagate(P, grid, dR, dC, true) then return false end
 						changed = true
 					end
@@ -419,19 +441,28 @@ local function probe(P, grid)
 	return true
 end
 
-local function search(P, grid, found, limit, budget)
+-- gr, gc, gv: the guess that made this node (none at the root)
+local function search(P, grid, found, limit, budget, depth, gr, gc, gv)
 	budget.n = budget.n - 1
 	if P.lines > P.scap then budget.n = -1 end
 	if budget.n < 0 then return end
 	-- probing only pays off at the root (it decides the sure cells there);
 	-- inside the search plain propagation is far cheaper per node
-	if not propagate(P, grid) then return end
+	local ok = propagate(P, grid)
+	if gr and Core.watch then
+		emit({ k = "g", r = gr, c = gc, v = gv, ok = ok, depth = depth, cells = { gr * 4096 + gc }, grid = grid, base = P.root })
+	end
+	if not ok then return end
 	local br, bc = firstUnknown(grid, P.R, P.C)
-	if not br then found[#found + 1] = grid return end
+	if not br then
+		found[#found + 1] = grid
+		if Core.watch then emit({ k = "f", n = #found, grid = grid, base = P.root }) end
+		return
+	end
 	for v = 1, 2 do
 		local t = copyGrid(grid, P.R, P.C)
 		t[br][bc] = v
-		search(P, t, found, limit, budget)
+		search(P, t, found, limit, budget, depth + 1, br, bc, v)
 		if #found >= limit or budget.n < 0 then return end
 	end
 end
@@ -440,9 +471,9 @@ end
 -- Returns { sol = grid|nil, sure = grid|nil, status = "unique"|"multiple"|"none"|"gaveup" }
 -- sure holds only cells that every solution shares (0 elsewhere); sol is one
 -- full answer, missing when the search ran out of budget before finding one.
--- trace: optional table that collects the proving steps (see record)
-function Core.solve(rows, cols, R, C, given, budget, cap, trace)
-	local P = { rows = rows, cols = cols, R = R, C = C, lines = 0, cap = cap or 30000, trace = trace }
+-- Core.watch, when set, sees every step (see emit)
+function Core.solve(rows, cols, R, C, given, budget, cap)
+	local P = { rows = rows, cols = cols, R = R, C = C, lines = 0, cap = cap or 30000 }
 	local grid = {}
 	for r = 1, R do
 		grid[r] = {}
@@ -451,6 +482,7 @@ function Core.solve(rows, cols, R, C, given, budget, cap, trace)
 	if not propagate(P, grid, nil, nil, true) then return { status = "none" } end
 	if firstUnknown(grid, R, C) and not probe(P, grid) then return { status = "none" } end
 	local root = copyGrid(grid, R, C)
+	P.root = root
 	if not firstUnknown(grid, R, C) then return { sol = grid, sure = grid, status = "unique" } end
 	-- the search only yields one full answer to show as guesses; with most of a
 	-- big board still open that answer is one random pick of many, so skip it
@@ -459,20 +491,12 @@ function Core.solve(rows, cols, R, C, given, budget, cap, trace)
 	if open > 400 and open > R * C * 0.15 then return { sure = root, status = "gaveup" } end
 	local found, b = {}, { n = budget or 3000 }
 	P.scap = P.lines + 15000
-	search(P, grid, found, 2, b)
+	search(P, grid, found, 2, b, 0)
 	if #found == 0 then
 		if b.n < 0 then return { sure = root, status = "gaveup" } end
 		return { status = "none" }
 	end
 	local unique = #found == 1 and b.n >= 0
-	if trace then
-		-- whatever logic could not reach came from the search: one last step
-		local cells, sol = {}, found[1]
-		for r = 1, R do for c = 1, C do
-			if root[r][c] == 0 then cells[#cells + 1] = r; cells[#cells + 1] = c; cells[#cells + 1] = sol[r][c] end
-		end end
-		record(P, { k = "s", cells = cells, guess = not unique })
-	end
 	if unique then return { sol = found[1], sure = found[1], status = "unique" } end
 	return { sol = found[1], sure = root, status = (#found > 1) and "multiple" or "gaveup" }
 end
@@ -482,7 +506,9 @@ end
 -- board reading
 ------------------------------------------------------------------------------
 local S = {
-	enabled = true, showCross = CFG.crosses, showProcess = CFG.showProcess, hl = {},
+	enabled = true, showCross = CFG.crosses, hl = {},
+	liveOn = CFG.live,     -- live solving view on new boards (F6)
+	lv = nil,              -- the live solve being shown, see startLive
 	board = nil,           -- see readBoard
 	_draw = {}, tri = {}, ln = {}, hud = nil,
 	tScan = 0, tState = 0, tRender = 0, tKey = 0,
@@ -491,6 +517,7 @@ local S = {
 	co = nil, msPerTile = 0,
 }
 _G.nonogram = S
+if wasLive ~= nil then S.liveOn = wasLive end -- a re-run keeps the F6 choice
 
 local function attr(inst, name)
 	local ok, v = pcall(function() return inst:GetAttribute(name) end)
@@ -661,10 +688,25 @@ end
 
 -- Solve every reading direction in turn (the Normal-side rule first) and keep
 -- the first that fits the clues and every tile already filled or crossed.
-local function solveBoard(B)
+-- start: set by the live view, which is told when a direction is dropped
+local function solveOrders(B, g, start)
 	local order = { { false, false }, { true, true }, { true, false }, { false, true } }
 	if B.reversed then order = { { true, true }, { false, false }, { true, false }, { false, true } } end
-	local g = givens(B)
+	local partial
+	for i, o in ipairs(order) do
+		if start and i > 1 and Core.watch then Core.watch({ k = "o", flip = o, grid = start, base = start }) end
+		local rows, cols = orientClues(B, o[1], o[2])
+		local res = Core.solve(rows, cols, B.R, B.C, g, 3000)
+		res.flip = o
+		if res.sol then return res end
+		-- ran out of budget without a contradiction: keep its proven cells
+		-- unless another direction gives a full answer
+		if res.sure and not partial then partial = res end
+	end
+	return partial or { status = "none" }
+end
+
+local function solveBoard(B)
 	local prevRes = B.res
 	if prevRes and prevRes.flip and prevRes.sure then
 		-- re-solve: proven cells still hold, so start from them plus the new
@@ -682,22 +724,7 @@ local function solveBoard(B)
 		if res.sol or res.sure then return res end
 		-- a contradiction means the old answer was wrong: full solve below
 	end
-	local partial
-	for _, o in ipairs(order) do
-		local rows, cols = orientClues(B, o[1], o[2])
-		local trace
-		if B.wantTrace then
-			trace = {}
-			B.trace, B.traceStart, B.traceGen = trace, g, (B.traceGen or 0) + 1
-		end
-		local res = Core.solve(rows, cols, B.R, B.C, g, 3000, nil, trace)
-		res.flip = o
-		if res.sol then return res end
-		-- ran out of budget without a contradiction: keep its proven cells
-		-- unless another direction gives a full answer
-		if res.sure and not partial then partial = res end
-	end
-	return partial or { status = "none" }
+	return solveOrders(B, givens(B))
 end
 
 local function startSolve()
@@ -736,6 +763,7 @@ local function stepSolve()
 	Core.pause = function()
 		if os.clock() - t0 > CFG.slice then coroutine.yield() end
 	end
+	Core.watch = nil -- the live view's hook is only set while its own solve runs
 	local ok, res = coroutine.resume(co)
 	Core.pause = nil
 	if not ok then
@@ -748,6 +776,78 @@ local function stepSolve()
 		S.co = nil
 		if S.board == S.coBoard and res then applyResult(S.board, res) end
 	end
+end
+
+------------------------------------------------------------------------------
+-- live solving view (F6): a second solve of the board, run step by step
+-- through Core.watch and drawn while it happens: every line it reads, every
+-- tile it tries both ways, every guess and dead end. The answer the overlay
+-- and auto fill use comes from the full-speed solve above, so watching never
+-- slows them down. Starts on every new board while on; F6 toggles it (and
+-- turning it on re-solves the current board live).
+------------------------------------------------------------------------------
+-- how long each kind of step stays up, relative to the pace
+local LIVE_W = { r = 1, c = 1, x = 2, t = 0.4, p = 1.5, g = 1, f = 2.5, o = 2, d = 0 }
+
+local function liveWatch(ev)
+	local L = S.lv
+	L.ev, L.steps = ev, L.steps + 1
+	local fl
+	if ev.cells then fl = {}; for _, k in ipairs(ev.cells) do fl[k] = true end end
+	L.flash = fl
+	S.rev = S.rev + 1
+	coroutine.yield("step")
+end
+
+local function startLive(B)
+	S.rev = S.rev + 1
+	if not B then S.lv = nil return end
+	local g = givens(B)
+	local start = {}
+	for r = 1, B.R do
+		start[r] = {}
+		for c = 1, B.C do start[r][c] = g[r][c] or 0 end
+	end
+	local now = os.clock()
+	local L = { board = B, steps = 0, t0 = now, tNext = now, ev = { k = "s", grid = start, base = start } }
+	L.co = coroutine.create(function()
+		local res = solveOrders(B, g, start)
+		Core.watch({ k = "d", status = res.status, grid = res.sol or res.sure, base = res.sure or start })
+		return res
+	end)
+	S.lv = L
+end
+
+local function tickLive(now)
+	local L = S.lv
+	if not L then return end
+	if L.board ~= S.board then S.lv = nil; S.rev = S.rev + 1 return end
+	if not L.co then
+		if now - L.tEnd > CFG.liveHold then S.lv = nil; S.rev = S.rev + 1 end
+		return
+	end
+	-- slow enough to follow at first; the pace doubles every liveHalf seconds
+	-- so a big board still finishes
+	local delay = CFG.livePace * 0.5 ^ ((now - L.t0) / CFG.liveHalf)
+	if L.tNext < now - 0.25 then L.tNext = now end
+	local t0 = os.clock()
+	Core.pause = function()
+		if os.clock() - t0 > CFG.liveSlice then coroutine.yield("slice") end
+	end
+	Core.watch = liveWatch
+	while now >= L.tNext and os.clock() - t0 < CFG.liveSlice do
+		local ok, what = coroutine.resume(L.co)
+		if not ok then
+			Core.pause, Core.watch = nil, nil
+			S.lv = nil
+			S.rev = S.rev + 1
+			error(what, 0)
+		end
+		if coroutine.status(L.co) == "dead" then L.co, L.tEnd = nil, now break end
+		if what == "slice" then break end
+		L.tNext = L.tNext + delay * (LIVE_W[L.ev.k] or 1)
+	end
+	Core.pause, Core.watch = nil, nil
 end
 
 ------------------------------------------------------------------------------
@@ -774,10 +874,9 @@ local function buildBoard()
 	if not B then S.status = err or "no board"; return false end
 	rebuildPending(B)
 	B.built = os.clock()
-	B.wantTrace = true
-	if S.showProcess then B.play = { gen = -1 } end -- starts once the trace does
 	S.board = B
 	startSolve()
+	if S.liveOn then startLive(B) end
 	return true
 end
 
@@ -966,7 +1065,7 @@ local function unchanged(cf, vp, fov)
 	local p, l = cf.Position, cf.LookVector
 	local B = S.board
 	local key = { p.X, p.Y, p.Z, l.X, l.Y, l.Z, vp and vp.X or 0, vp and vp.Y or 0, fov or 0,
-		S.rev, S.status, B or false, B and B.res or false, S.enabled, S.showCross, S.autoTag or false }
+		S.rev, S.status, B or false, B and B.res or false, S.enabled, S.showCross, S.autoTag or false, S.liveOn, S.lv or false }
 	local old, same = S.drawnKey, true
 	if not old then same = false
 	else for i = 1, #key do if key[i] ~= old[i] then same = false break end end end
@@ -975,94 +1074,70 @@ local function unchanged(cf, vp, fov)
 end
 
 ------------------------------------------------------------------------------
--- solving process replay: the solver's proving steps played back on the
--- board. While a slow solve is still running it plays live behind it.
+-- live view drawing: the step text and the outline of what it is looking at
 ------------------------------------------------------------------------------
-local function newPlay(B)
-	local shown, guess = {}, {}
-	local g = B.traceStart
-	for r = 1, B.R do
-		shown[r], guess[r] = {}, {}
-		for c = 1, B.C do shown[r][c] = (g and g[r] and g[r][c]) or 0 end
-	end
-	return { i = 0, gen = B.traceGen, shown = shown, guess = guess, flash = {}, tNext = os.clock() }
+local function clueText(nums)
+	local parts = {}
+	for _, v in ipairs(nums or {}) do parts[#parts + 1] = (v < 0) and "?" or tostring(v) end
+	return table.concat(parts, " ")
 end
 
-local function tickPlay(now)
-	local B = S.board
-	local pl = B and B.play
-	if not pl then return end
-	-- a new trace (first solve, or another reading direction) restarts it
-	if pl.gen ~= B.traceGen then
-		if not B.trace then return end
-		pl = newPlay(B)
-		B.play = pl
-		S.rev = S.rev + 1
+local function liveText(B, L)
+	local head = string.format("live solve  step %d", L.steps)
+	local ev = L.ev
+	local k = ev.k
+	if L.tEnd and k ~= "d" then return head .. "   stopped" end
+	if k == "s" then return head .. "   starting from the tiles already filled or crossed" end
+	if k == "r" or k == "c" then
+		local n = #ev.cells
+		return string.format("%s   %s [%s] proves %d %s", head, k == "r" and "row" or "column",
+			clueText((k == "r") and B.rows[ev.i] or B.cols[ev.i]), n, n == 1 and "tile" or "tiles")
+	elseif k == "x" then
+		return string.format("%s   %s [%s] can't fit: this reading of the clues is wrong", head,
+			ev.line == "r" and "row" or "column", clueText((ev.line == "r") and B.rows[ev.i] or B.cols[ev.i]))
+	elseif k == "o" then
+		local fr, fc = ev.flip[1], ev.flip[2]
+		local how = (fr and fc) and "backwards" or fr and "backwards on rows only"
+			or fc and "backwards on columns only" or "the normal way"
+		return string.format("%s   no fit, trying the clues read %s", head, how)
+	elseif k == "t" then
+		return string.format("%s   no line helps: what if this tile is %s?  %s", head,
+			ev.v == 1 and "filled" or "empty", ev.ok and "no contradiction" or "contradiction!")
+	elseif k == "p" then
+		local n = #ev.cells
+		return string.format("%s   trying the tile both ways proves %d %s", head, n, n == 1 and "tile" or "tiles")
+	elseif k == "g" then
+		return string.format("%s   logic ran out: guessing %s (depth %d)%s", head,
+			ev.v == 1 and "filled" or "empty", ev.depth, ev.ok and "" or "  dead end, backing up")
+	elseif k == "f" then
+		return head .. (ev.n == 1 and "   found an answer, checking it's the only one"
+			or "   found a second answer: the clues allow more than one")
+	elseif k == "d" then
+		local names = { unique = "solved", multiple = "ambiguous (yellow = guessed)",
+			gaveup = "partial, gave up", none = "no solution" }
+		return head .. "   done: " .. (names[ev.status] or tostring(ev.status))
 	end
-	local tr = B.trace
-	local n = #tr
-	local solving = S.co ~= nil and S.coBoard == B
-	local delay = solving and CFG.playLive
-		or math.max(CFG.playMin, math.min(CFG.playMax, CFG.playTime / math.max(n, 1)))
-	if pl.tNext < now - 0.25 then pl.tNext = now end
-	local moved, burst = false, 0
-	while pl.i < n and now >= pl.tNext and burst < 400 do
-		pl.i = pl.i + 1
-		local st = tr[pl.i]
-		local fl, cells = {}, st.cells
-		for q = 1, #cells, 3 do
-			local r, c = cells[q], cells[q + 1]
-			pl.shown[r][c] = cells[q + 2]
-			if st.guess then pl.guess[r][c] = true end
-			fl[r * 4096 + c] = true
-		end
-		pl.flash, pl.cur = fl, st
-		pl.tNext = pl.tNext + delay
-		moved, burst = true, burst + 1
-	end
-	if moved then S.rev = S.rev + 1 end
-	if pl.i >= n and not solving and B.res then
-		if not pl.tEnd then
-			pl.tEnd, pl.flash = now, {}
-			S.rev = S.rev + 1
-		elseif now - pl.tEnd > CFG.playHold then
-			B.play = nil
-			S.rev = S.rev + 1
-		end
-	end
+	return head
 end
 
-local function stepText(B, pl)
-	local n = B.trace and #B.trace or 0
-	local head = string.format("solving process  step %d/%d%s", pl.i, n, (S.co and S.coBoard == B) and "+" or "")
-	local st = pl.cur
-	if not st then return head .. "   starting from the tiles already filled or crossed" end
-	if pl.tEnd then return head .. "   done" end
-	local cnt = #st.cells / 3
-	local tiles = cnt == 1 and "tile" or "tiles"
-	if st.k == "r" or st.k == "c" then
-		local nums = (st.k == "r") and B.rows[st.i] or B.cols[st.i]
-		local parts = {}
-		for _, v in ipairs(nums or {}) do parts[#parts + 1] = (v < 0) and "?" or tostring(v) end
-		return string.format("%s   %s [%s] proves %d %s", head, st.k == "r" and "row" or "column",
-			table.concat(parts, " "), cnt, tiles)
-	elseif st.k == "p" then
-		return string.format("%s   no line helps: trying a tile both ways proves %d %s", head, cnt, tiles)
-	end
-	return string.format("%s   %s %d %s", head, st.guess and "logic ran out, guessing" or "a search settles the last", cnt, tiles)
-end
-
--- outline around the row / column (or probed tile) of the current step
-local function drawOutline(proj, B, pl, y)
-	local st = pl and not pl.tEnd and pl.cur
+-- outline around the row / column (or tile) the current step looks at
+local function drawOutline(proj, B, L, y)
+	local ev = L and L.ev
 	local hh = B and B.half or 0
-	local x0, x1, z0, z1
-	if st and st.k == "r" then
-		x0, x1, z0, z1 = B.xs[1] - hh, B.xs[B.C] + hh, B.zs[st.i] - hh, B.zs[st.i] + hh
-	elseif st and st.k == "c" then
-		x0, x1, z0, z1 = B.xs[st.i] - hh, B.xs[st.i] + hh, B.zs[1] - hh, B.zs[B.R] + hh
-	elseif st and st.k == "p" then
-		x0, x1, z0, z1 = B.xs[st.j] - hh, B.xs[st.j] + hh, B.zs[st.i] - hh, B.zs[st.i] + hh
+	local x0, x1, z0, z1, col
+	local line = ev and ((ev.k == "r" or ev.k == "c") and ev.k or (ev.k == "x" and ev.line))
+	if line == "r" then
+		x0, x1, z0, z1 = B.xs[1] - hh, B.xs[B.C] + hh, B.zs[ev.i] - hh, B.zs[ev.i] + hh
+	elseif line == "c" then
+		x0, x1, z0, z1 = B.xs[ev.i] - hh, B.xs[ev.i] + hh, B.zs[1] - hh, B.zs[B.R] + hh
+	elseif ev and ev.r and ev.c then
+		x0, x1, z0, z1 = B.xs[ev.c] - hh, B.xs[ev.c] + hh, B.zs[ev.r] - hh, B.zs[ev.r] + hh
+	end
+	if ev then
+		if ev.k == "x" or ev.ok == false then col = COL.empty
+		elseif ev.k == "g" then col = COL.guess
+		elseif ev.k == "t" or ev.k == "p" then col = COL.probe
+		else col = COL.hl end
 	end
 	local pts
 	if x0 then
@@ -1084,7 +1159,7 @@ local function drawOutline(proj, B, pl, y)
 		end
 		if pts then
 			o.From, o.To = pts[k], pts[k % 4 + 1]
-			show(o, st.k == "p" and COL.probe or COL.hl)
+			show(o, col)
 		else
 			hide(o)
 		end
@@ -1097,10 +1172,16 @@ local function render()
 	local t0 = os.clock()
 	local nt, nl = 0, 0
 	local B = S.board
-	local pl = B and B.play
-	if pl and pl.gen ~= B.traceGen then pl = nil end -- trace not started yet
+	local L = S.lv
+	if L and L.board ~= B then L = nil end
 	local y = B and B.top + 0.05
-	if S.enabled and B and (pl or (B.res and (B.res.sol or B.res.sure))) then
+	if S.enabled and B and (L or (B.res and (B.res.sol or B.res.sure))) then
+		-- live view: cells known in the step's grid but not yet proven are what
+		-- a trial (purple) or a guess (yellow) would make them
+		local lg = L and L.ev.grid
+		local lb = L and L.ev.base
+		local tent = L and (L.ev.k == "t" and COL.probe or COL.guess)
+		local fl = L and L.flash
 		local h = B.half * CFG.inset * 2
 		local vw, vh = vp and vp.X or 1e9, vp and vp.Y or 1e9
 		local guesses = B.showGuesses
@@ -1116,12 +1197,13 @@ local function render()
 			-- v: 1 draw a fill quad, 2 draw an X; col: its colour
 			local v, col
 			if t.state == 0 then
-				if pl then
-					local sv = pl.shown[t.r][t.c]
+				if L then
+					local sv = lg and lg[t.r][t.c] or 0
 					if sv ~= 0 then
 						v = sv
-						if pl.flash[t.r * 4096 + t.c] then col = COL.flash
-						elseif sv == 1 then col = pl.guess[t.r][t.c] and COL.guess or COL.fill
+						if fl and fl[t.r * 4096 + t.c] then col = COL.flash
+						elseif lb and lb[t.r][t.c] == 0 then col = tent
+						elseif sv == 1 then col = COL.fill
 						else col = COL.empty end
 					end
 				elseif t.want == 1 and (t.sure or guesses) then
@@ -1166,7 +1248,7 @@ local function render()
 	end
 	for i = nt + 1, #S.tri do hide(S.tri[i]) end
 	for i = nl + 1, #S.ln do hide(S.ln[i]) end
-	drawOutline(proj, B, S.enabled and pl or nil, y)
+	drawOutline(proj, B, S.enabled and L or nil, y)
 
 	local hud, hud2 = S.hud, S.hud2
 	if not hud then
@@ -1202,10 +1284,11 @@ local function render()
 			txt = "nonogram  [" .. tostring(S.status) .. "]"
 		end
 		if S.autoTag then txt = txt .. "  |  auto: " .. S.autoTag end
+		if S.liveOn then txt = txt .. "  |  live view on (F6)" end
 		if hud.Text ~= txt then hud.Text = txt end
 		show(hud)
-		if pl then
-			local t2 = stepText(B, pl)
+		if L then
+			local t2 = liveText(B, L)
 			if hud2.Text ~= t2 then hud2.Text = t2 end
 			show(hud2)
 		else
@@ -1731,6 +1814,10 @@ S._r = RunService.RenderStepped:Connect(function()
 		if not ok then S.status = "state error"; report("state", e) end
 	end
 	if S.co then stepSolve() end
+	if S.lv then
+		local ok, e = pcall(tickLive, now)
+		if not ok then Core.pause, Core.watch, S.lv = nil, nil, nil; report("live view", e) end
+	end
 	if now - S.tScan >= CFG.pace then
 		S.tScan = now
 		local ok, e = pcall(tickScan)
@@ -1738,11 +1825,6 @@ S._r = RunService.RenderStepped:Connect(function()
 	end
 	if now - S.tRender >= ((S.board and S.board.n > CFG.bigBoard) and 0.05 or CFG.render) then
 		S.tRender = now
-		local okp, ep = pcall(tickPlay, now)
-		if not okp then
-			if S.board then S.board.play = nil end
-			report("replay", ep)
-		end
 		local ok, e = pcall(render)
 		if not ok then report("render", e) end
 	end
@@ -1759,9 +1841,9 @@ S._r = RunService.RenderStepped:Connect(function()
 		local ad = iskeypressed(CFG.autokey)
 		if ad and not S.autoWas then S.autofill() end
 		S.autoWas = ad
-		local rd = iskeypressed(CFG.replaykey)
-		if rd and not S.replayWas then S.replay() end
-		S.replayWas = rd
+		local ld = iskeypressed(CFG.livekey)
+		if ld and not S.liveWas then S.live() end
+		S.liveWas = ld
 	end
 end)
 
@@ -1775,17 +1857,21 @@ S.crosses = function(b)
 	print("[nonogram] crosses " .. (S.showCross and "on" or "off"))
 end
 S.rescan = function() dropBoard("rescanning"); S.state = nil; S.tState = 0 end
--- replay how the current board was solved (F6)
-S.replay = function()
-	local B = S.board
-	if not (B and B.trace) then print("[nonogram] nothing to replay yet") return end
-	B.play = newPlay(B)
-	S.rev = S.rev + 1
+-- live solving view on / off (F6). On: the current board is solved again
+-- live right away, and so is every new board, until it is turned off.
+S.live = function(b)
+	if b == nil then b = not S.liveOn end
+	S.liveOn = b and true or false
+	if S.liveOn then startLive(S.board) else S.lv = nil; S.rev = S.rev + 1 end
+	local msg = S.liveOn and "live solving view on" or "live solving view off"
+	print("[nonogram] " .. msg)
+	pcall(notify, msg, "nonogram", 2)
 end
--- replay each new board's solve automatically (on by default)
-S.process = function(b)
-	S.showProcess = (b ~= false)
-	print("[nonogram] solving process " .. (S.showProcess and "shown on new boards" or "off (F6 still replays)"))
+S.process = S.live
+-- watch the current board get solved live once more, without changing the mode
+S.replay = function()
+	if not S.board then print("[nonogram] no board yet") return end
+	startLive(S.board)
 end
 
 S.info = function()
@@ -1835,5 +1921,5 @@ S.stop = function()
 	print("[nonogram] stopped")
 end
 
-print("[nonogram] running. F8 overlay, F7 auto fill, F6 replay the solve   _G.nonogram.info() / .dump() / .autofill() / .autoinfo() / .replay() / .stop()")
+print("[nonogram] running. F8 overlay, F7 auto fill, F6 live solving view   _G.nonogram.info() / .dump() / .autofill() / .autoinfo() / .live() / .stop()")
 if wasArmed or CFG.autoArm then S.autofill(true) end

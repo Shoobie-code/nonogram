@@ -59,7 +59,8 @@ local function clue(pos, nums)
 	return p
 end
 
-local function buildWorld()
+local function buildWorld(pic)
+	if pic then PIC, N = pic, #pic end
 	ws = inst("Workspace")
 	local tiles = ws:add(inst("Tiles"))
 	tilesByRC = {}
@@ -107,7 +108,14 @@ end
 
 local realPrint = print
 local quiet = true
-print = function(...) if not quiet then realPrint(...) end end
+local errs = {}
+print = function(...)
+	local line = table.concat({ ... }, " ")
+	for _, w in ipairs({ "render: ", "state: ", "scan: ", "auto: ", "live view: ", "solver error" }) do
+		if line:find("[nonogram] " .. w, 1, true) == 1 then errs[#errs + 1] = line end
+	end
+	if not quiet then realPrint(...) end
+end
 
 local function load()
 	local f = assert(loadfile(SCRIPT))
@@ -148,6 +156,8 @@ frames(600, 0.05)
 check(A.on, "still armed after repeated errors")
 check(A.benched ~= nil, "sits out the board after repeated errors")
 isrbxactive = function() return true end
+check(#errs > 0, "the injected error was reported")
+for i = #errs, 1, -1 do errs[i] = nil end
 
 -- a new board clears the bench
 serverData._attr.State = "Intermission"
@@ -193,6 +203,127 @@ S = load()
 frames(5)
 check(not S.autoState.on, "re-run after disarm stays off")
 S.stop()
+
+------------------------------------------------------------------------------
+-- live solving view
+------------------------------------------------------------------------------
+buildWorld()
+installGlobals()
+S = load()
+check(S.liveOn == true, "live view on by default")
+frames(40) -- about 0.64 s
+check(S.lv ~= nil, "live solve started when the board spawned")
+check(S.status == "solved", "the answer doesn't wait for the live view")
+local early = S.lv and S.lv.steps or 0
+check(early >= 2 and early <= 20, "live solve is paced (steps after 0.6 s: " .. early .. ")")
+local sawKinds, doneStatus = {}, nil
+for _ = 1, 600 do
+	frames(1)
+	local L = S.lv
+	if L then
+		sawKinds[L.ev.k] = true
+		if L.ev.k == "d" then doneStatus = L.ev.status end
+	end
+end
+check(sawKinds.r and sawKinds.c, "live view shows rows and columns being solved")
+check(doneStatus == "unique", "live solve ends solved, got " .. tostring(doneStatus))
+check(S.lv == nil, "live view clears after it finishes")
+
+S.live(false)
+check(not S.liveOn and S.lv == nil, "F6 turns the live view off")
+S = load()
+frames(5)
+check(S.liveOn == false, "re-run keeps the live view off")
+S.live(true)
+check(S.lv ~= nil and S.lv.board == S.board, "turning it on solves the current board live")
+S = load()
+check(S.liveOn == true, "re-run keeps the live view on")
+-- a new board restarts it
+serverData._attr.State = "Intermission"; frames(20, 0.05)
+check(S.lv == nil, "live view dropped with the board")
+serverData._attr.State = "RoundActive"; frames(30, 0.05)
+check(S.lv ~= nil and S.lv.board == S.board, "live view starts on the next board")
+S.stop()
+
+-- an ambiguous board (4x4, one tile per row and column): no line helps, so
+-- the live view has to try tiles both ways and then guess
+buildWorld({ "1000", "0100", "0010", "0001" })
+installGlobals()
+S = load()
+local amb, ambDone = {}, nil
+for _ = 1, 1500 do
+	frames(1)
+	local L = S.lv
+	if L then
+		amb[L.ev.k] = true
+		if L.ev.k == "d" then ambDone = L.ev.status end
+	end
+end
+check(amb.t and amb.g and amb.f, "ambiguous board: live view shows trials, guesses and answers")
+check(ambDone == "multiple", "ambiguous board: live solve ends ambiguous, got " .. tostring(ambDone))
+check(S.status == "ambiguous", "ambiguous board: overlay status, got " .. tostring(S.status))
+S.stop()
+check(#errs == 0, "no errors reported by the script: " .. table.concat(errs, " | "))
+
+------------------------------------------------------------------------------
+-- solver core, straight from the script
+------------------------------------------------------------------------------
+local src = io.open(SCRIPT):read("*a")
+local coreSrc = src:match("%-%-%[%[<<CORE>>%]%](.-)%-%-%[%[<</CORE>>%]%]")
+check(coreSrc ~= nil, "core section found")
+local Core = assert(loadstring(coreSrc .. "\nreturn Core"))()
+
+local function cluesOf(pic, R, C)
+	local rows, cols = {}, {}
+	for r = 1, R do local b = {} for c = 1, C do b[c] = pic[r][c] end rows[r] = { nums = runs(b) } end
+	for c = 1, C do local b = {} for r = 1, R do b[r] = pic[r][c] end cols[c] = { nums = runs(b) } end
+	return rows, cols
+end
+local function fitsClues(g, rows, cols, R, C)
+	for r = 1, R do
+		local b = {} for c = 1, C do b[c] = g[r][c] == 1 and 1 or 0 end
+		if table.concat(runs(b), ",") ~= table.concat(rows[r].nums, ",") then return false end
+	end
+	for c = 1, C do
+		local b = {} for r = 1, R do b[r] = g[r][c] == 1 and 1 or 0 end
+		if table.concat(runs(b), ",") ~= table.concat(cols[c].nums, ",") then return false end
+	end
+	return true
+end
+
+math.randomseed(7)
+local kinds, same, valid, fits, total = {}, true, true, true, 0
+for _ = 1, 60 do
+	local R, C = math.random(4, 10), math.random(4, 10)
+	local pic = {}
+	for r = 1, R do pic[r] = {} for c = 1, C do pic[r][c] = (math.random() < 0.5) and 1 or 0 end end
+	local rows, cols = cluesOf(pic, R, C)
+	local plain = Core.solve(rows, cols, R, C)
+	rows, cols = cluesOf(pic, R, C) -- fresh clue tables (prepClue caches on them)
+	Core.watch = function(ev)
+		total = total + 1
+		kinds[ev.k] = true
+		for _, key in ipairs(ev.cells or {}) do
+			local r, c = math.floor(key / 4096), key % 4096
+			if not (ev.grid[r] and ev.grid[r][c] ~= 0) then valid = false end
+		end
+		if (ev.k == "r" or ev.k == "c" or ev.k == "p") and ev.grid ~= ev.base then valid = false end
+	end
+	local watched = Core.solve(rows, cols, R, C)
+	Core.watch = nil
+	if plain.status ~= watched.status then same = false end
+	if plain.sol and watched.sol then
+		for r = 1, R do for c = 1, C do if plain.sol[r][c] ~= watched.sol[r][c] then same = false end end end
+		if not fitsClues(watched.sol, rows, cols, R, C) then fits = false end
+	end
+	if watched.status == "none" then fits = false end
+end
+check(same, "watching doesn't change the solver's answers")
+check(valid, "every step's tiles are set in its grid")
+check(fits, "every answer fits its clues")
+for _, k in ipairs({ "r", "c", "t", "p", "g", "f" }) do
+	check(kinds[k], "random puzzles produce '" .. k .. "' steps")
+end
 
 print = realPrint
 print(string.format("%d passed, %d failed", passes, fails))
