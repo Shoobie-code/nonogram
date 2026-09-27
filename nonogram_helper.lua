@@ -10,6 +10,7 @@
     Console API (after running):
         _G.nonogram.toggle()        show / hide the overlay
         _G.nonogram.autofill()      arm / disarm auto fill (same as F7)
+        _G.nonogram.autoinfo()      print what auto fill is doing and why
         _G.nonogram.replay()        replay the solving process (same as F6)
         _G.nonogram.process(false)  stop replaying every new board's solve
         _G.nonogram.crosses(true)   also mark the tiles that must stay empty
@@ -17,8 +18,13 @@
         _G.nonogram.info()          print the current solve summary
         _G.nonogram.dump()          print the solution as ascii
         _G.nonogram.stop()          tear everything down
-    F8 toggles the overlay, F7 arms / disarms auto fill (it stays armed across
-    rounds), F6 replays how the current board was solved.
+    F8 toggles the overlay, F7 arms / disarms auto fill, F6 replays how the
+    current board was solved.
+
+    Auto fill is persistent: once armed it only disarms on F7 (or .autofill()
+    / .stop()). Round ends, finished boards, timeouts, mistakes, getting stuck,
+    fill-mode trouble and errors make it back off or sit out the current board,
+    never disarm. Re-running the script keeps it armed.
 
     Colours:  green  = fill this tile (walk over it in fill mode)
               yellow = fill, but only a best guess (clues are hidden or ambiguous)
@@ -28,6 +34,8 @@
 local CFG = {
 	togglekey = 0x77,   -- F8: overlay
 	autokey   = 0x76,   -- F7: auto fill
+	autoArm   = false,  -- arm auto fill as soon as the script starts
+	                    -- (re-running the script keeps it armed either way)
 	autoSprint = true,  -- hold shift while walking when the round allows sprinting
 	autoGuesses = false, -- auto fill also steps on guessed tiles (costs lives when wrong)
 	pace      = 0.1,    -- seconds between tile-state scan ticks
@@ -66,6 +74,7 @@ local COL = {
 ------------------------------------------------------------------------------
 local prev = _G.nonogram
 _G.nonogram = nil
+local wasArmed = prev and prev.autoState and prev.autoState.on == true
 if prev then
 	pcall(function() if prev._r then prev._r:Disconnect() end end)
 	if prev.autoState then for vk in pairs(prev.autoState.held or {}) do pcall(keyrelease, vk) end end
@@ -1338,7 +1347,8 @@ local function steer(dx, dz, sprint)
 	akey(VK.SHIFT, sprint)
 end
 
--- disarm: only F7, or trouble that keeps coming back
+-- disarm: only F7 (or .autofill(false) / .stop()). Trouble never lands
+-- here; it backs off (autoWait) or sits out the board (autoBench).
 local function autoStop(reason, quiet)
 	releaseAll()
 	A.on, A.phase, A.nextFn, A.hrp, A.lp, A.stopAt = false, "idle", nil, nil, nil, nil
@@ -1386,6 +1396,24 @@ local function autoFinish(reason)
 	end
 end
 
+-- say something once per board (and once per repeat of the same text)
+local function autoSay(msg)
+	if A.lastSaid == msg then return end
+	A.lastSaid = msg
+	print("[nonogram] auto fill: " .. msg)
+	pcall(notify, msg, "nonogram auto fill", 3)
+end
+
+-- trouble that keeps coming back on this board: stay armed but hands off
+-- until the next board. Fill mode is switched off first when possible
+-- (autoTick keeps trying while benched), so walking by hand stays safe.
+local function autoBench(reason)
+	releaseMove()
+	A.benched = reason
+	autoSay(reason .. ", sitting out this board (still armed)")
+	if A.phase ~= "switch" then A.phase = "plan" end
+end
+
 local function runNext()
 	local fn = A.nextFn
 	A.nextFn = nil
@@ -1407,9 +1435,11 @@ local function tickSwitch(now)
 	if m == A.want then A.switchFails = 0; runNext() return end
 	if A.tapDone and now - A.tapDone < 0.35 then return end
 	if A.tries >= 4 then
+		-- chat open, a menu, or Hold To Fill on: keep retrying, slower each time
 		A.switchFails = (A.switchFails or 0) + 1
 		if A.switchFails >= 3 then
-			autoStop("could not switch fill mode (chat open, or Hold To Fill on?)")
+			autoSay("could not switch fill mode (chat open, or Hold To Fill on?), retrying")
+			autoWait(math.min(3 * A.switchFails, 15), "fill mode won't switch, retrying")
 		else
 			autoWait(3, "fill mode didn't switch, retrying")
 		end
@@ -1456,7 +1486,7 @@ local function tickMove(now, p)
 		if A.stuck >= 4 then
 			A.stuck = 0
 			A.stuckTotal = (A.stuckTotal or 0) + 1
-			if A.stuckTotal >= 5 then autoStop("keeps getting stuck on this board") return end
+			if A.stuckTotal >= 5 then autoBench("keeps getting stuck") return end
 			autoWait(2, "blocked, retrying")
 			return
 		end
@@ -1494,15 +1524,11 @@ local function tickPlan(now, p)
 		end
 		if waiting > 0 then autoWait(0.3, "checking the last tiles") return end
 		local tag = unsure > 0 and "sure tiles done, waiting for more clues" or "board done, waiting for the next round"
-		if A.doneSaid ~= tag then
-			A.doneSaid = tag
-			print("[nonogram] auto fill: " .. tag)
-			pcall(notify, tag, "nonogram auto fill", 3)
-		end
+		autoSay(tag)
 		autoWait(0.5, tag)
 		return
 	end
-	A.doneSaid = nil
+	A.lastSaid = nil
 	if m == 1 then
 		if not cur then
 			-- between tiles (a group gap) with fill on: turn it off first
@@ -1550,8 +1576,8 @@ end
 local function autoNewBoard(B)
 	releaseAll()
 	A.board, A.phase, A.nextFn = B, "plan", nil
-	A.mistakes, A.stuck, A.stuckTotal, A.switchFails = 0, 0, 0, 0
-	A.inTimeout, A.away, A.doneSaid, A.inCell = false, false, nil, nil
+	A.mistakes, A.stuck, A.stuckTotal, A.switchFails, A.errors = 0, 0, 0, 0, 0
+	A.inTimeout, A.away, A.lastSaid, A.inCell, A.benched = false, false, nil, nil, nil
 	A.hrp, A.lp, A.speed = nil, nil, 0
 	local sd = workspace:FindFirstChild("ServerData")
 	A.noWalk = sd and attr(sd, "CurrentDisableWalkSetting") == true
@@ -1601,7 +1627,7 @@ local function autoTick()
 		local inTo = type(to) == "number" and to > 0
 		if inTo and not A.inTimeout then
 			A.mistakes = (A.mistakes or 0) + 1
-			if A.mistakes >= 2 then autoStop("two mistakes on this board, stopped") return end
+			if A.mistakes >= 2 and not A.benched then autoBench("two mistakes") end
 		end
 		A.inTimeout = inTo
 		local ps = lp and attr(lp, "PlayingState")
@@ -1612,6 +1638,15 @@ local function autoTick()
 		releaseMove()
 		A.phase = "plan"
 		A.tag = A.inTimeout and "mistake timeout, waiting" or "not playing this round"
+		S.autoTag = A.tag
+		return
+	end
+	if A.benched and A.phase ~= "switch" then
+		releaseMove()
+		A.tag = "sitting out this board (" .. A.benched .. ")"
+		if A.phase == "wait" and now < A.waitUntil then S.autoTag = A.tag return end
+		-- fill mode goes off so the next step (by hand or next board) is safe
+		if A.mode == 1 then startSwitch(-1, function() A.phase = "plan" end) end
 		S.autoTag = A.tag
 		return
 	end
@@ -1643,7 +1678,22 @@ local function autoTick()
 	S.autoTag = A.on and A.tag or nil
 end
 
--- armed until F7: it waits out round ends, finished boards and timeouts
+-- an error inside a tick: hands off for a second and try again; one that
+-- keeps coming back sits out the board. Never disarms.
+local function autoError()
+	releaseAll()
+	A.errors = (A.errors or 0) + 1
+	A.phase, A.nextFn = "plan", nil
+	if A.errors >= 5 then
+		if not A.benched then autoBench("keeps hitting errors") end
+		autoWait(5, "error, backing off")
+	else
+		autoWait(1, "error, retrying")
+	end
+end
+
+-- armed until F7: it waits out round ends, finished boards, timeouts and
+-- trouble (see autoBench / autoError)
 local function autoStart()
 	A.on, A.tag, A.stopAt = true, "starting", nil
 	A.board = false -- forces autoNewBoard on the first tick
@@ -1655,6 +1705,15 @@ S.autofill = function(b)
 	if b == nil then b = not A.on end
 	if b and not A.on then autoStart()
 	elseif not b and A.on then autoFinish("stopped") end
+end
+
+S.autoinfo = function()
+	if not A.on then print("[nonogram] auto fill is off (F7 arms it)") return end
+	print(string.format("[nonogram] auto fill armed  phase %s  [%s]  fill mode %s",
+		tostring(A.phase), tostring(A.tag), tostring(A.mode)))
+	print(string.format("[nonogram] this board: mistakes %d  stuck %d  switch fails %d  errors %d  %s",
+		A.mistakes or 0, A.stuckTotal or 0, A.switchFails or 0, A.errors or 0,
+		A.benched and ("sitting out: " .. A.benched) or "working"))
 end
 ------------------------------------------------------------------------------
 -- main loop: everything on RenderStepped behind elapsed-time gates
@@ -1690,7 +1749,7 @@ S._r = RunService.RenderStepped:Connect(function()
 	if A.on and now - A.tCtl >= 0.008 then
 		A.tCtl = now
 		local ok, e = pcall(autoTick)
-		if not ok then autoStop("error, stopped"); report("auto", e) end
+		if not ok then autoError(); report("auto", e) end
 	end
 	if now - S.tKey >= 0.05 then
 		S.tKey = now
@@ -1776,4 +1835,5 @@ S.stop = function()
 	print("[nonogram] stopped")
 end
 
-print("[nonogram] running. F8 overlay, F7 auto fill, F6 replay the solve   _G.nonogram.info() / .dump() / .autofill() / .replay() / .stop()")
+print("[nonogram] running. F8 overlay, F7 auto fill, F6 replay the solve   _G.nonogram.info() / .dump() / .autofill() / .autoinfo() / .replay() / .stop()")
+if wasArmed or CFG.autoArm then S.autofill(true) end
